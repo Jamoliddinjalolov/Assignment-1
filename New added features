@@ -1,0 +1,171 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from numpy.linalg import solve
+
+# Load and Clean the Dataset
+# --------------------------
+# Load the dataset from the URL
+df = pd.read_csv('https://www.stlouisfed.org/-/media/project/frbstl/stlouisfed/research/fred-md/monthly/current.csv?sc_lang=en&hash=80445D12401C59CF716410F3F7863B64')
+
+# Remove the row with transformation codes
+df_cleaned = df.drop(index=0)
+df_cleaned.reset_index(drop=True, inplace=True)
+df_cleaned['sasdate'] = pd.to_datetime(df_cleaned['sasdate'], format='%m/%d/%Y')
+
+# Extract transformation codes
+transformation_codes = df.iloc[0, 1:].to_frame().reset_index()
+transformation_codes.columns = ['Series', 'Transformation_Code']
+
+# Define Transformation Function
+# ------------------------------
+# Function to apply transformations based on transformation code
+def apply_transformation(series, code):
+    if code == 1:
+        return series  # No transformation
+    elif code == 2:
+        return series.diff()  # First difference
+    elif code == 3:
+        return series.diff().diff()  # Second difference
+    elif code == 4:
+        return np.log(series)  # Log
+    elif code == 5:
+        return np.log(series).diff()  # First difference of log
+    elif code == 6:
+        return np.log(series).diff().diff()  # Second difference of log
+    elif code == 7:
+        return series.pct_change()  # Delta (percentage change)
+    else:
+        raise ValueError("Invalid transformation code")
+
+# Apply the transformations to each column
+# ----------------------------------------
+for series_name, code in transformation_codes.values:
+    df_cleaned[series_name] = apply_transformation(df_cleaned[series_name].astype(float), float(code))
+
+# Drop the first two rows after transformation (NaN values after differencing)
+df_cleaned = df_cleaned[2:]
+df_cleaned.reset_index(drop=True, inplace=True)
+
+# Plot Transformed Data for Selected Series
+# -----------------------------------------
+series_to_plot = ['INDPRO', 'CPIAUCSL', 'TB3MS']  # Selected series
+series_names = ['Industrial Production', 'Inflation (CPI)', '3-month Treasury Bill rate']
+
+# Create a figure with subplots for each series
+fig, axs = plt.subplots(len(series_to_plot), 1, figsize=(8, 15))
+
+for ax, series_name, plot_title in zip(axs, series_to_plot, series_names):
+    if series_name in df_cleaned.columns:
+        dates = pd.to_datetime(df_cleaned['sasdate'], format='%m/%d/%Y')
+        ax.plot(dates, df_cleaned[series_name], label=plot_title, color='darkblue')
+        ax.xaxis.set_major_locator(mdates.YearLocator(base=5))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax.set_title(plot_title, fontsize=12, fontweight='bold')
+        ax.set_xlabel('Year', fontsize=10)
+        ax.set_ylabel('Transformed Value', fontsize=10)
+        ax.legend(loc='upper left')
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    else:
+        ax.set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+# Prepare Data for Regression
+# ---------------------------
+# The 'Yraw' variable represents the dependent variable (INDPRO)
+Yraw = df_cleaned['INDPRO']
+
+# The 'Xraw' DataFrame contains the independent variables (CPIAUCSL, TB3MS)
+Xraw = df_cleaned[['CPIAUCSL', 'TB3MS']]
+
+num_lags = 4  # Number of lags (p)
+num_leads = 1  # Number of leads (h)
+X = pd.DataFrame()
+
+# Add lagged values of Y (dependent variable)
+for lag in range(0, num_lags+1):
+    X[f'INDPRO_lag{lag}'] = Yraw.shift(lag)
+
+# Add lagged values of the independent variables
+for col in Xraw.columns:
+    for lag in range(0, num_lags+1):
+        X[f'{col}_lag{lag}'] = Xraw[col].shift(lag)
+
+# Add a column of ones for the intercept
+X.insert(0, 'Ones', np.ones(len(X)))
+
+# Show the first rows of the lagged dataset
+X.head()
+
+# Shift the dependent variable by the number of leads (forecast horizon)
+y = Yraw.shift(-num_leads)
+
+# Prepare Data for OLS Regression
+X_T = X.iloc[-1:].values  # Last row (to use for forecast)
+y = y.iloc[num_lags:-num_leads].values  # Align the dependent variable with lagged values
+X = X.iloc[num_lags:-num_leads].values  # Align the independent variables
+
+# Perform OLS Regression
+beta_ols = solve(X.T @ X, X.T @ y)
+
+# Produce a one-step-ahead forecast
+forecast = X_T @ beta_ols * 100
+forecast  # Show the forecast result
+
+# Function to Calculate Forecast and Errors
+# -----------------------------------------
+def calculate_forecast(df_cleaned, p=4, H=[1, 4, 8], end_date='12/1/1999', target='INDPRO', xvars=['CPIAUCSL', 'TB3MS']):
+    # Subset the data up to the specified end_date
+    rt_df = df_cleaned[df_cleaned['sasdate'] <= pd.Timestamp(end_date)]
+    
+    # Get actual values of the target variable at different horizons (T+H)
+    Y_actual = []
+    for h in H:
+        os = pd.Timestamp(end_date) + pd.DateOffset(months=h)
+        Y_actual.append(df_cleaned[df_cleaned['sasdate'] == os][target] * 100)
+
+    # Prepare lagged variables
+    Yraw = rt_df[target]
+    Xraw = rt_df[xvars]
+    X = pd.DataFrame()
+
+    for lag in range(0, p):
+        X[f'{target}_lag{lag}'] = Yraw.shift(lag)
+
+    for col in Xraw.columns:
+        for lag in range(0, p):
+            X[f'{col}_lag{lag}'] = Xraw[col].shift(lag)
+    
+    X.insert(0, 'Ones', np.ones(len(X)))  # Add intercept
+    X_T = X.iloc[-1:].values  # Last row of X
+
+    Yhat = []
+    for h in H:
+        y_h = Yraw.shift(-h)
+        y = y_h.iloc[p:-h].values
+        X_ = X.iloc[p:-h].values
+        beta_ols = solve(X_.T @ X_, X_.T @ y)
+        Yhat.append(X_T @ beta_ols * 100)
+
+    # Return forecasting errors
+    return np.array(Y_actual) - np.array(Yhat)
+
+# Generate Forecasting Errors
+t0 = pd.Timestamp('12/1/1999')
+errors = []
+T = []
+
+for j in range(0, 10):
+    t0 = t0 + pd.DateOffset(months=1)
+    print(f'Using data up to {t0}')
+    ehat = calculate_forecast(df_cleaned, p=4, H=[1, 4, 8], end_date=t0)
+    errors.append(ehat.flatten())
+    T.append(t0)
+
+# Convert the errors into a DataFrame and calculate RMSFE
+edf = pd.DataFrame(errors)
+rmsfe = np.sqrt(edf.apply(np.square).mean())
+rmsfe
